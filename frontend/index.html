@@ -1,0 +1,41 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>BE-1 Salesforce Ingestion Console</title>
+  <style>
+    body{font-family:system-ui,sans-serif;max-width:1200px;margin:30px auto;padding:0 16px;background:#0f172a;color:#e2e8f0}
+    .card{background:#111827;border:1px solid #334155;border-radius:12px;padding:18px;margin:14px 0}
+    input,button{padding:9px;border-radius:8px;border:1px solid #475569;background:#0b1220;color:#e2e8f0} button{cursor:pointer}
+    table{width:100%;border-collapse:collapse}th,td{padding:9px;border-bottom:1px solid #334155;text-align:left;font-size:14px}
+    .ok{color:#86efac}.bad{color:#fca5a5}.warn{color:#fde68a}.muted{color:#94a3b8}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
+  </style>
+</head>
+<body>
+<h1>BE-1 Salesforce Bulk Ingestion Console</h1>
+<div class="card">
+  <h3>Trigger Bulk Sync</h3>
+  <input id="org" value="demo-org" placeholder="organization_id" />
+  <input id="records" type="number" value="100" min="1" max="100000" />
+  <button onclick="sync()">Trigger Sync — 10 Objects</button>
+  <p id="message" class="muted"></p>
+</div>
+<div class="grid">
+  <div class="card"><b>Jobs</b><div id="jobsCount">-</div></div>
+  <div class="card"><b>Completed</b><div id="completed">-</div></div>
+  <div class="card"><b>Rows</b><div id="rows">-</div></div>
+  <div class="card"><b>Raw Objects</b><div id="raw">-</div></div>
+</div>
+<div class="card"><h3>Jobs</h3><table><thead><tr><th>ID</th><th>Status</th><th>Current</th><th>Objects</th><th>Rows</th><th>Error</th><th>Actions</th></tr></thead><tbody id="jobs"></tbody></table></div>
+<div class="card"><h3>MinIO Raw Files</h3><table><thead><tr><th>Key</th><th>Size</th><th>Last Modified</th></tr></thead><tbody id="files"></tbody></table></div>
+<script>
+const api='/api/v1';
+async function sync(){const organization_id=document.getElementById('org').value;const records_per_object=Number(document.getElementById('records').value);const r=await fetch(api+'/jobs/sync',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({organization_id,records_per_object})});const d=await r.json();document.getElementById('message').textContent=r.ok?`Started ${d.job_id}`:JSON.stringify(d);refresh();}
+async function action(id,a){await fetch(`${api}/jobs/${id}/${a}`,{method:'POST'});refresh();}
+async function refresh(){const [jr,fr]=await Promise.all([fetch(api+'/jobs'),fetch(api+'/storage')]);const jobs=await jr.json();const files=await fr.json();document.getElementById('jobsCount').textContent=jobs.length;document.getElementById('completed').textContent=jobs.filter(x=>x.status==='completed').length;document.getElementById('rows').textContent=jobs.reduce((a,x)=>a+(x.total_rows||0),0);document.getElementById('raw').textContent=files.length;
+document.getElementById('jobs').innerHTML=jobs.map(j=>`<tr><td>${j.job_id.slice(0,8)}</td><td class="${j.status==='completed'?'ok':j.status==='failed'?'bad':'warn'}">${j.status}</td><td>${j.current_object||'-'}</td><td>${j.processed_objects}/${j.objects.length}</td><td>${j.total_rows}</td><td>${j.error||''}</td><td>${j.status==='running'||j.status==='pending'?`<button onclick="action('${j.job_id}','pause')">Pause</button>`:''}${j.status==='paused'?`<button onclick="action('${j.job_id}','resume')">Resume</button>`:''}${['pending','running','paused'].includes(j.status)?`<button onclick="action('${j.job_id}','cancel')">Cancel</button>`:''}</td></tr>`).join('');
+document.getElementById('files').innerHTML=files.map(f=>`<tr><td>${f.key}</td><td>${f.size}</td><td>${f.last_modified}</td></tr>`).join('');}
+refresh();setInterval(refresh,3000);
+</script>
+</body></html>
