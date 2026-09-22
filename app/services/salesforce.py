@@ -9,8 +9,16 @@ from app.config import settings
 from app.services.retry import retry_call
 
 OBJECTS = [
-    "Accounts", "Contacts", "Opportunities", "Leads", "Tasks",
-    "Cases", "Products", "PricebookEntries", "Contracts", "Assets",
+    "Accounts",
+    "Contacts",
+    "Opportunities",
+    "Leads",
+    "Tasks",
+    "Cases",
+    "Products",
+    "PricebookEntries",
+    "Contracts",
+    "Assets",
 ]
 
 
@@ -56,6 +64,7 @@ class SalesforceBulkClient:
 
     def wait_for_job(self, token: str, job_id: str) -> dict:
         for _ in range(300):
+
             def request():
                 response = self.client.get(
                     f"{self.base}/services/data/v60.0/jobs/query/{job_id}",
@@ -68,7 +77,9 @@ class SalesforceBulkClient:
             if data["state"] in {"JobComplete", "Failed", "Aborted"}:
                 return data
             time.sleep(0.2)
-        raise TimeoutError(f"Salesforce Bulk job {job_id} did not finish within 60 seconds")
+        raise TimeoutError(
+            f"Salesforce Bulk job {job_id} did not finish within 60 seconds"
+        )
 
     def results(self, token: str, job_id: str) -> str:
         def request():
@@ -77,7 +88,20 @@ class SalesforceBulkClient:
                 headers=self._headers(token),
             )
             response.raise_for_status()
-            return response.text
+
+            text = response.text
+
+            # Mock Salesforce returns the CSV as a JSON-encoded string.
+            # Decode it so downstream CSV parsing receives real CSV text.
+            if text.startswith('"') and text.endswith('"'):
+                try:
+                    import json
+
+                    text = json.loads(text)
+                except json.JSONDecodeError:
+                    pass
+
+            return text
 
         return retry_call(request)
 
@@ -86,7 +110,9 @@ class SalesforceBulkClient:
         job_id = self.create_query_job(token, obj, records)
         state = self.wait_for_job(token, job_id)
         if state["state"] != "JobComplete":
-            raise RuntimeError(state.get("errorMessage", f"Salesforce job ended in {state['state']}"))
+            raise RuntimeError(
+                state.get("errorMessage", f"Salesforce job ended in {state['state']}")
+            )
         return job_id, self.results(token, job_id)
 
 
@@ -96,23 +122,122 @@ def csv_rows(obj: str, text: str, organisation_id: str):
     out = []
     for row in reader:
         if obj == "Accounts":
-            out.append([row.get("Id", ""), row.get("Name", ""), row.get("Industry"), row.get("Website"), organisation_id, now])
+            out.append(
+                [
+                    row.get("Id", ""),
+                    row.get("Name", ""),
+                    row.get("Industry"),
+                    row.get("Website"),
+                    organisation_id,
+                    now,
+                ]
+            )
         elif obj == "Contacts":
-            out.append([row.get("Id", ""), row.get("FirstName", ""), row.get("LastName", ""), row.get("Email"), row.get("AccountId"), organisation_id, now])
+            out.append(
+                [
+                    row.get("Id", ""),
+                    row.get("FirstName", ""),
+                    row.get("LastName", ""),
+                    row.get("Email"),
+                    row.get("AccountId"),
+                    organisation_id,
+                    now,
+                ]
+            )
         elif obj == "Opportunities":
-            out.append([row.get("Id", ""), row.get("Name", ""), float(row.get("Amount") or 0), row.get("StageName", ""), row.get("AccountId"), organisation_id, now])
+            out.append(
+                [
+                    row.get("Id", ""),
+                    row.get("Name", ""),
+                    float(row.get("Amount") or 0),
+                    row.get("StageName", ""),
+                    row.get("AccountId"),
+                    organisation_id,
+                    now,
+                ]
+            )
         elif obj == "Leads":
-            out.append([row.get("Id", ""), row.get("FirstName", ""), row.get("LastName", ""), row.get("Company"), row.get("Email"), row.get("Status", ""), organisation_id, now])
+            out.append(
+                [
+                    row.get("Id", ""),
+                    row.get("FirstName", ""),
+                    row.get("LastName", ""),
+                    row.get("Company"),
+                    row.get("Email"),
+                    row.get("Status", ""),
+                    organisation_id,
+                    now,
+                ]
+            )
         elif obj == "Tasks":
-            out.append([row.get("Id", ""), row.get("Subject", ""), row.get("Status", ""), row.get("ActivityDate", ""), row.get("OwnerId"), organisation_id, now])
+            out.append(
+                [
+                    row.get("Id", ""),
+                    row.get("Subject", ""),
+                    row.get("Status", ""),
+                    row.get("ActivityDate", ""),
+                    row.get("OwnerId"),
+                    organisation_id,
+                    now,
+                ]
+            )
         elif obj == "Cases":
-            out.append([row.get("Id", ""), row.get("Subject", ""), row.get("Status", ""), row.get("Priority", ""), row.get("AccountId"), organisation_id, now])
+            out.append(
+                [
+                    row.get("Id", ""),
+                    row.get("Subject", ""),
+                    row.get("Status", ""),
+                    row.get("Priority", ""),
+                    row.get("AccountId"),
+                    organisation_id,
+                    now,
+                ]
+            )
         elif obj == "Products":
-            out.append([row.get("Id", ""), row.get("Name", ""), row.get("ProductCode", ""), row.get("Family"), str(row.get("IsActive", "true")).lower() == "true", organisation_id, now])
+            out.append(
+                [
+                    row.get("Id", ""),
+                    row.get("Name", ""),
+                    row.get("ProductCode", ""),
+                    row.get("Family"),
+                    str(row.get("IsActive", "true")).lower() == "true",
+                    organisation_id,
+                    now,
+                ]
+            )
         elif obj == "PricebookEntries":
-            out.append([row.get("Id", ""), row.get("Product2Id", ""), float(row.get("UnitPrice") or 0), str(row.get("IsActive", "true")).lower() == "true", organisation_id, now])
+            out.append(
+                [
+                    row.get("Id", ""),
+                    row.get("Product2Id", ""),
+                    float(row.get("UnitPrice") or 0),
+                    str(row.get("IsActive", "true")).lower() == "true",
+                    organisation_id,
+                    now,
+                ]
+            )
         elif obj == "Contracts":
-            out.append([row.get("Id", ""), row.get("AccountId"), row.get("Status", ""), row.get("StartDate", ""), row.get("EndDate", ""), organisation_id, now])
+            out.append(
+                [
+                    row.get("Id", ""),
+                    row.get("AccountId"),
+                    row.get("Status", ""),
+                    row.get("StartDate", ""),
+                    row.get("EndDate", ""),
+                    organisation_id,
+                    now,
+                ]
+            )
         elif obj == "Assets":
-            out.append([row.get("Id", ""), row.get("Name", ""), row.get("AccountId"), row.get("Product2Id"), row.get("Status", ""), organisation_id, now])
+            out.append(
+                [
+                    row.get("Id", ""),
+                    row.get("Name", ""),
+                    row.get("AccountId"),
+                    row.get("Product2Id"),
+                    row.get("Status", ""),
+                    organisation_id,
+                    now,
+                ]
+            )
     return out
