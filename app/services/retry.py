@@ -48,16 +48,28 @@ def retry_call(
     base_delay: float = 0.5,
     max_delay: float = 30.0,
     sleep: Callable[[float], None] = time.sleep,
+    deadline: float | None = None,
+    clock: Callable[[], float] = time.monotonic,
 ):
     """Call ``fn`` with exponential backoff + jitter; honours Retry-After on 408/429/5xx."""
     for attempt in range(attempts):
+        if deadline is not None and clock() >= deadline:
+            raise TimeoutError("Operation deadline exceeded")
         try:
-            return fn()
+            result = fn()
+            if deadline is not None and clock() >= deadline:
+                raise TimeoutError("Operation deadline exceeded")
+            return result
         except Exception as exc:
+            if deadline is not None and clock() >= deadline:
+                raise TimeoutError("Operation deadline exceeded") from exc
             if attempt == attempts - 1 or not is_retryable(exc):
                 raise
             delay = min(max_delay, base_delay * (2**attempt) + random.random() * 0.2)
             retry_after = retry_after_seconds(exc)
             if retry_after is not None:
-                delay = min(max_delay, max(delay, retry_after))
+                delay = max(delay, retry_after)
+            if deadline is not None and delay >= deadline - clock():
+                # Do not retry earlier than requested just to fit the deadline.
+                raise TimeoutError("Retry delay exceeds operation deadline") from exc
             sleep(delay)

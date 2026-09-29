@@ -21,19 +21,28 @@ class SalesforceBulkClient:
         client: httpx.Client | None = None,
         base_url: str | None = None,
         sleep: Callable[[float], None] = time.sleep,
+        clock: Callable[[], float] = time.monotonic,
     ):
         self.base = (base_url or settings.salesforce_base_url).rstrip("/")
         self.login_url = (settings.salesforce_login_url or self.base).rstrip("/")
         self.client = client or httpx.Client(timeout=httpx.Timeout(60.0, connect=10.0))
         self._sleep = sleep
+        self._clock = clock
         self._token: str | None = None
         self._api = f"/services/data/{settings.salesforce_api_version}"
 
     # ---- auth -----------------------------------------------------------
-    def authenticate(self) -> str:
+    def _timeout(self, deadline: float | None) -> httpx.Timeout:
+        remaining = 60.0 if deadline is None else deadline - self._clock()
+        if remaining <= 0:
+            raise TimeoutError("Salesforce job deadline exceeded")
+        return httpx.Timeout(min(60.0, remaining), connect=min(10.0, remaining))
+
+    def authenticate(self, deadline: float | None = None) -> str:
         def request():
             response = self.client.post(
                 f"{self.login_url}/services/oauth2/token",
+                timeout=self._timeout(deadline),
                 data={
                     "grant_type": "refresh_token",
                     "client_id": settings.salesforce_client_id,
@@ -44,27 +53,28 @@ class SalesforceBulkClient:
             response.raise_for_status()
             return response.json()
 
-        data = retry_call(request, sleep=self._sleep)
+        data = retry_call(request, sleep=self._sleep, deadline=deadline, clock=self._clock)
         self._token = data["access_token"]
         if data.get("instance_url"):  # real orgs tell us which instance to call
             self.base = data["instance_url"].rstrip("/")
         return self._token
 
-    def _request(self, method: str, path: str, **kwargs) -> httpx.Response:
+    def _request(self, method: str, path: str, *, deadline: float | None = None, **kwargs) -> httpx.Response:
         """Authenticated request with backoff; re-authenticates once on 401 (expired token)."""
         for attempt in (0, 1):
             if not self._token:
-                self.authenticate()
+                self.authenticate(deadline=deadline)
 
             def call():
                 response = self.client.request(
-                    method, f"{self.base}{path}", headers={"Authorization": f"Bearer {self._token}"}, **kwargs
+                    method, f"{self.base}{path}", headers={"Authorization": f"Bearer {self._token}"},
+                    timeout=self._timeout(deadline), **kwargs
                 )
                 response.raise_for_status()
                 return response
 
             try:
-                return retry_call(call, sleep=self._sleep)
+                return retry_call(call, sleep=self._sleep, deadline=deadline, clock=self._clock)
             except httpx.HTTPStatusError as exc:
                 if exc.response.status_code == 401 and attempt == 0:
                     self._token = None
@@ -82,13 +92,13 @@ class SalesforceBulkClient:
         return response.json()["id"]
 
     def wait_for_job(self, job_id: str) -> dict:
-        waited, delay = 0.0, 0.2
-        while waited <= settings.job_timeout_seconds:
-            data = self._request("GET", f"{self._api}/jobs/query/{job_id}").json()
+        deadline = self._clock() + settings.job_timeout_seconds
+        delay = 0.2
+        while self._clock() < deadline:
+            data = self._request("GET", f"{self._api}/jobs/query/{job_id}", deadline=deadline).json()
             if data["state"] in TERMINAL_STATES:
                 return data
-            self._sleep(delay)
-            waited += delay
+            self._sleep(min(delay, max(0.0, deadline - self._clock())))
             delay = min(delay * 1.5, 5.0)
         raise TimeoutError(f"Salesforce Bulk job {job_id} did not finish within {settings.job_timeout_seconds}s")
 

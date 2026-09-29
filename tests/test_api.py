@@ -54,3 +54,14 @@ def test_sync_rejects_unknown_object(client, auth_headers):
         json={"organization_id": "org1", "objects": ["NotARealObject"]},
     )
     assert response.status_code == 400
+
+
+def test_sync_deduplicates_objects(client, auth_headers, monkeypatch):
+    from app.api.routes import manager
+
+    captured = []
+    monkeypatch.setattr(manager, "start", lambda org, objects, records: captured.append(objects) or "synthetic-job")
+    response = client.post("/api/v1/jobs/sync", headers=auth_headers,
+                           json={"organization_id": "org", "objects": ["Contacts", "Accounts", "Contacts"]})
+    assert response.status_code == 202
+    assert captured == [["Contacts", "Accounts"]]

@@ -40,7 +40,7 @@ def _now():
 class JobManager:
     def __init__(self):
         self.threads: dict[str, threading.Thread] = {}
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.slots = threading.Semaphore(settings.max_concurrent_jobs)
 
     # ---------- helpers ----------------------------------------------------
@@ -64,11 +64,11 @@ class JobManager:
         """Call once at process start: any job left "running" belongs to a dead process."""
         session = SessionLocal()
         try:
-            orphans = session.query(IngestionJob).filter(IngestionJob.status.in_(["running", "pausing", "cancelling"])).all()
+            orphans = session.query(IngestionJob).filter(IngestionJob.status.in_(["pending", "running", "pausing", "cancelling"])).all()
             for job in orphans:
+                log.warning("recovering orphaned %s job %s", job.status, job.id)
                 job.status = "interrupted"
                 job.current_object = None
-                log.warning("job %s was %s at startup, marked interrupted", job.id, job.status)
             session.commit()
             ids = [j.id for j in orphans]
         finally:
@@ -88,7 +88,7 @@ class JobManager:
                     id=job_id,
                     organization_id=organization_id,
                     status="pending",
-                    objects_json=json.dumps(objects),
+                    objects_json=json.dumps(list(dict.fromkeys(objects))),
                     completed_objects_json="[]",
                     records_per_object=records_per_object,
                 )
@@ -100,85 +100,120 @@ class JobManager:
         return job_id
 
     def pause(self, job_id: str) -> str:
-        session = SessionLocal()
-        try:
-            job = self._get(session, job_id)
-            if not job:
-                return NOT_FOUND
-            if job.status not in {"pending", "running"}:
-                return CONFLICT
-            # Checked between objects by the worker loop; can't interrupt an in-flight Salesforce call.
-            job.status = "pausing" if job.status == "running" else "paused"
-            session.commit()
-            return OK
-        finally:
-            session.close()
+        with self.lock:
+            session = SessionLocal()
+            try:
+                job = self._get(session, job_id)
+                if not job:
+                    return NOT_FOUND
+                if job.status not in {"pending", "running"}:
+                    return CONFLICT
+                # Checked between objects by the worker loop; can't interrupt an in-flight Salesforce call.
+                job.status = "pausing" if job.status == "running" else "paused"
+                session.commit()
+                return OK
+            finally:
+                session.close()
 
     def cancel(self, job_id: str) -> str:
-        session = SessionLocal()
-        try:
-            job = self._get(session, job_id)
-            if not job:
-                return NOT_FOUND
-            if job.status in TERMINAL:
-                return CONFLICT
-            job.status = "cancelling" if job.status == "running" else "cancelled"
-            if job.status == "cancelled":
-                job.finished_at = _now()
-            session.commit()
-            return OK
-        finally:
-            session.close()
+        with self.lock:
+            session = SessionLocal()
+            try:
+                job = self._get(session, job_id)
+                if not job:
+                    return NOT_FOUND
+                if job.status in {"cancelled", "cancelling"}:
+                    return OK
+                if job.status in TERMINAL:
+                    return CONFLICT
+                job.status = "cancelling" if job.status in {"running", "pausing"} else "cancelled"
+                if job.status == "cancelled":
+                    job.finished_at = _now()
+                session.commit()
+                return OK
+            finally:
+                session.close()
 
     def resume(self, job_id: str) -> str:
-        session = SessionLocal()
-        try:
-            job = self._get(session, job_id)
-            if not job:
-                return NOT_FOUND
-            if job.status not in RESUMABLE:
-                return CONFLICT
-            job.status = "pending"
-            job.error = None
-            session.commit()
-        finally:
-            session.close()
-        self._spawn(job_id)
-        return OK
+        with self.lock:
+            session = SessionLocal()
+            try:
+                job = self._get(session, job_id)
+                if not job:
+                    return NOT_FOUND
+                if job.status not in RESUMABLE:
+                    return CONFLICT
+                job.status = "pending"
+                job.error = None
+                job.finished_at = None
+                session.commit()
+            finally:
+                session.close()
+            self._spawn(job_id)
+            return OK
 
     def _spawn(self, job_id: str):
-        t = threading.Thread(target=self._run, args=(job_id,), daemon=True, name=f"job-{job_id[:8]}")
         with self.lock:
+            # A paused queued job can still have a thread waiting for a slot.
+            existing = self.threads.get(job_id)
+            if existing and existing.is_alive():
+                return
+            t = threading.Thread(target=self._run, args=(job_id,), daemon=True, name=f"job-{job_id[:8]}")
             self.threads[job_id] = t
-        t.start()
+            t.start()
 
     # ---------- execution ----------------------------------------------------
     def _run(self, job_id: str):
-        acquired = self.slots.acquire(timeout=settings.job_timeout_seconds)
-        if not acquired:
-            self._set_status(job_id, "failed", error="Timed out waiting for a free worker slot")
-            return
+        acquired = False
         try:
+            acquired = self.slots.acquire(timeout=settings.job_timeout_seconds)
+            if not acquired:
+                with self.lock, SessionLocal() as session:
+                    job = self._get(session, job_id)
+                    if job and job.status == "pending":
+                        job.status = "failed"
+                        job.error = "Timed out waiting for a free worker slot"
+                        job.finished_at = _now()
+                        session.commit()
+                return
             self._execute(job_id)
-        except Exception as exc:  # belt-and-braces: never leave a job stuck "running"
+        except Exception as exc:
             log.exception("job %s crashed", job_id)
-            self._set_status(job_id, "failed", error=str(exc), finished_at=_now())
+            self._fail(job_id, str(exc))
         finally:
-            self.slots.release()
+            if acquired:
+                self.slots.release()
+            with self.lock:
+                self.threads.pop(job_id, None)
+                # Resume may have arrived after this thread acknowledged pause,
+                # but before it exited. Start the replacement only now.
+                with SessionLocal() as session:
+                    job = self._get(session, job_id)
+                    pending = job is not None and job.status == "pending"
+                if pending:
+                    self._spawn(job_id)
 
     def _execute(self, job_id: str):
-        session = SessionLocal()
-        try:
+        with self.lock, SessionLocal() as session:
             job = self._get(session, job_id)
-            if not job:
+            if not job or job.status != "pending":
                 return
-            objects: list[str] = json.loads(job.objects_json)
-            completed: list[str] = json.loads(job.completed_objects_json)
+            objects = list(dict.fromkeys(json.loads(job.objects_json)))
+            completed = list(dict.fromkeys(json.loads(job.completed_objects_json)))
+            # Repair checkpoints written by versions that committed the object
+            # and aggregate progress separately. Keep legacy JSON-only entries.
+            checkpoints = session.query(JobObject).filter_by(job_id=job_id, state="JobComplete").all()
+            for checkpoint in checkpoints:
+                if checkpoint.object_name not in completed:
+                    completed.append(checkpoint.object_name)
+                    job.total_rows += checkpoint.rows
+            job.objects_json = json.dumps(objects)
+            job.completed_objects_json = json.dumps(completed)
+            job.processed_objects = len(completed)
             job.status = "running"
             job.started_at = job.started_at or _now()
+            job.finished_at = None
             session.commit()
-        finally:
-            session.close()
 
         sf = SalesforceBulkClient()
         storage = MinioStorage()
@@ -189,11 +224,11 @@ class JobManager:
             if obj in completed:
                 continue
 
-            if self._should_stop(job_id):
-                return  # pause()/cancel() already set the final status
-
-            self._set_current(job_id, obj)
-            self._upsert_job_object(job_id, obj, state="InProgress", started_at=_now())
+            with self.lock:
+                if self._should_stop(job_id):
+                    return
+                self._set_current(job_id, obj)
+                self._upsert_job_object(job_id, obj, state="InProgress", started_at=_now(), finished_at=None, error=None)
 
             try:
                 sf_job_id, csv_text = sf.run(obj, self._records_per_object(job_id))
@@ -204,20 +239,30 @@ class JobManager:
                 rows = csv_rows(obj, landed, organisation_id=self._org_id(job_id))
                 clickhouse.insert_rows(obj, rows)
 
-                self._upsert_job_object(
-                    job_id, obj, state="JobComplete", salesforce_job_id=sf_job_id,
-                    rows=len(rows), minio_key=key, finished_at=_now(), error=None,
-                )
+                self._complete_object(job_id, obj, sf_job_id, key, len(rows))
                 completed.append(obj)
-                self._advance(job_id, obj, completed, rows_added=len(rows))
 
             except Exception as exc:
                 log.exception("job %s object %s failed", job_id, obj)
                 self._upsert_job_object(job_id, obj, state="Failed", error=str(exc), finished_at=_now())
-                self._set_status(job_id, "failed", error=f"{obj}: {exc}", finished_at=_now(), current_object=None)
+                self._fail(job_id, f"{obj}: {exc}")
                 return
 
-        self._set_status(job_id, "completed", finished_at=_now(), current_object=None)
+        with self.lock:
+            if not self._should_stop(job_id):
+                self._set_status(job_id, "completed", finished_at=_now(), current_object=None)
+
+    def _fail(self, job_id: str, error: str):
+        with self.lock, SessionLocal() as session:
+            job = self._get(session, job_id)
+            if job and job.status in {"pending", "running"}:
+                job.status = "failed"
+                job.error = error
+                job.finished_at = _now()
+                job.current_object = None
+                session.commit()
+            else:
+                self._should_stop(job_id)
 
     # ---------- small persistence helpers ----------------------------------------------------
     def _should_stop(self, job_id: str) -> bool:
@@ -237,7 +282,7 @@ class JobManager:
                 job.finished_at = _now()
                 session.commit()
                 return True
-            return False
+            return job.status != "running"
         finally:
             session.close()
 
@@ -273,16 +318,24 @@ class JobManager:
         finally:
             session.close()
 
-    def _advance(self, job_id: str, obj: str, completed: list[str], rows_added: int):
-        session = SessionLocal()
-        try:
+    def _complete_object(self, job_id: str, obj: str, sf_job_id: str, key: str, rows: int):
+        # Object state and aggregate progress must become durable together.
+        with self.lock, SessionLocal() as session:
             job = self._get(session, job_id)
+            checkpoint = session.query(JobObject).filter_by(job_id=job_id, object_name=obj).one()
+            completed = json.loads(job.completed_objects_json)
+            if obj not in completed:
+                completed.append(obj)
+                job.total_rows += rows
+            checkpoint.state = "JobComplete"
+            checkpoint.salesforce_job_id = sf_job_id
+            checkpoint.rows = rows
+            checkpoint.minio_key = key
+            checkpoint.finished_at = _now()
+            checkpoint.error = None
             job.completed_objects_json = json.dumps(completed)
             job.processed_objects = len(completed)
-            job.total_rows = (job.total_rows or 0) + rows_added
             session.commit()
-        finally:
-            session.close()
 
 
 manager = JobManager()

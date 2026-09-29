@@ -1,6 +1,6 @@
 import json
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from app.auth import require_auth
 from app.db import SessionLocal
@@ -17,6 +17,11 @@ class SyncRequest(BaseModel):
     organization_id: str = Field(min_length=1, max_length=128)
     objects: list[str] = Field(default_factory=lambda: OBJECTS.copy(), min_length=1)
     records_per_object: int = Field(default=1000, ge=1, le=100000)
+
+    @field_validator("objects")
+    @classmethod
+    def unique_objects(cls, objects: list[str]) -> list[str]:
+        return list(dict.fromkeys(objects))
 
 
 @router.post("/jobs/sync", status_code=202)

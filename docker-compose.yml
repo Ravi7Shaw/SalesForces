@@ -17,8 +17,8 @@ services:
     image: pgsty/minio:RELEASE.2026-08-04T00-00-00Z
     command: server /data --console-address ":9001"
     environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-minioadmin}
     ports: ["9000:9000", "9001:9001"]
     volumes: ["miniodata:/data"]
     healthcheck:
@@ -31,13 +31,13 @@ services:
     image: clickhouse/clickhouse-server:25.8
     environment:
       CLICKHOUSE_DB: analytics
-      CLICKHOUSE_USER: default
-      CLICKHOUSE_PASSWORD: ""
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-}
       CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
     ports: ["8123:8123", "9002:9000"]
     volumes: ["chdata:/var/lib/clickhouse"]
     healthcheck:
-      test: ["CMD-SHELL", "clickhouse-client --query \"SELECT 1\" >/dev/null"]
+      test: ["CMD-SHELL", "clickhouse-client --user \"$$CLICKHOUSE_USER\" --password \"$$CLICKHOUSE_PASSWORD\" --query \"SELECT 1\" >/dev/null"]
       interval: 5s
       timeout: 5s
       retries: 20
@@ -57,22 +57,28 @@ services:
     environment:
       DATABASE_URL: postgresql+psycopg://postgres:postgres@postgres:5432/be1
       MINIO_ENDPOINT: minio:9000
-      MINIO_ACCESS_KEY: minioadmin
-      MINIO_SECRET_KEY: minioadmin
-      MINIO_BUCKET: salesforce-raw
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
+      MINIO_BUCKET: ${MINIO_BUCKET:-salesforce-raw}
       CLICKHOUSE_HOST: clickhouse
       CLICKHOUSE_PORT: 8123
-      CLICKHOUSE_USER: default
-      CLICKHOUSE_PASSWORD: ""
-      SALESFORCE_MODE: mock
-      SALESFORCE_BASE_URL: http://mock-salesforce:9000
-      SALESFORCE_CLIENT_ID: mock-client
-      SALESFORCE_CLIENT_SECRET: mock-secret
-      SALESFORCE_REFRESH_TOKEN: mock-refresh
-      AUTH_ENABLED: "true"
-      API_KEY: dev-local-key
-      HMAC_SECRET: dev-local-hmac-secret
-      MAX_CONCURRENT_JOBS: "2"
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-}
+      SALESFORCE_MODE: ${SALESFORCE_MODE:-mock}
+      SALESFORCE_BASE_URL: ${SALESFORCE_BASE_URL:-http://mock-salesforce:9000}
+      SALESFORCE_LOGIN_URL: ${SALESFORCE_LOGIN_URL:-}
+      SALESFORCE_API_VERSION: ${SALESFORCE_API_VERSION:-v60.0}
+      SALESFORCE_CLIENT_ID: ${SALESFORCE_CLIENT_ID:-mock-client}
+      SALESFORCE_CLIENT_SECRET: ${SALESFORCE_CLIENT_SECRET:-mock-secret}
+      SALESFORCE_REFRESH_TOKEN: ${SALESFORCE_REFRESH_TOKEN:-mock-refresh}
+      AUTH_ENABLED: ${AUTH_ENABLED:-true}
+      API_KEY: ${API_KEY-dev-local-key}
+      HMAC_SECRET: ${HMAC_SECRET-dev-local-hmac-secret}
+      MAX_CONCURRENT_JOBS: ${MAX_CONCURRENT_JOBS:-2}
+      AUTO_RESUME_ON_STARTUP: ${AUTO_RESUME_ON_STARTUP:-false}
+      AUTH_MAX_SKEW_SECONDS: ${AUTH_MAX_SKEW_SECONDS:-300}
+      BULK_PAGE_SIZE: ${BULK_PAGE_SIZE:-50000}
+      JOB_TIMEOUT_SECONDS: ${JOB_TIMEOUT_SECONDS:-900}
     ports: ["8000:8000"]
     depends_on:
       postgres:

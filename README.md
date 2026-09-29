@@ -58,9 +58,10 @@ those three can't drift out of sync with each other.
   row count, landed key, error, timing)
 - **API authentication** (`X-API-Key` or HMAC request signing with replay protection) required
   on every `/api/v1/*` route; the app refuses to start with auth on and no credentials set
-- **Crash recovery**: a startup sweep marks any job still `running` as `interrupted`;
+- **Crash recovery**: a startup sweep marks orphaned `pending`, `running`, `pausing`, and `cancelling` jobs as `interrupted`;
   `/resume` accepts `paused`, `interrupted` and `failed`, and skips objects already recorded in
   the checkpoint. Previously a crash left a job stuck `running` forever with no way to resume it
+- Duplicate requested objects are deduplicated in request order
 - Pause / resume / cancel, checked between objects (not mid-fetch — see Known limitations)
 - Worker concurrency capped by `MAX_CONCURRENT_JOBS`
 - Exponential backoff + jitter, retrying 408/429/5xx and transport errors, honouring
@@ -87,6 +88,15 @@ Open:
 - MinIO console: http://localhost:9001 (`minioadmin` / `minioadmin`)
 - ClickHouse HTTP: http://localhost:8123
 - Mock Salesforce: http://localhost:9003
+
+Compose passes Salesforce, authentication, and worker settings from `.env` to the API.
+Database and storage **addresses** inside Compose use their service names. Storage
+credentials are shared by the API and the corresponding service. After changing `.env`,
+run `docker compose up -d` to recreate affected containers.
+
+The example `SALESFORCE_BASE_URL=http://mock-salesforce:9000` is for Compose. If you run
+`uvicorn app.main:app` on the host against the containers, set it to
+`http://localhost:9003`; the mock returns an instance URL matching the incoming request.
 
 ## Run the 10-object demo
 
@@ -142,7 +152,9 @@ curl -H 'X-API-Key: dev-local-key' 'http://localhost:8000/api/v1/storage?prefix=
 ## Tests
 
 ```bash
-pytest -q                            # locally, no services required (sqlite + fakes)
+python -m pytest -q                  # locally, no services required (sqlite + fakes)
+node --test tests/dashboard.test.cjs # dashboard regression tests (Node 18+)
+python -m pytest -q tests/test_compose.py # Compose configuration (requires Docker Compose CLI)
 docker compose run --rm api pytest -q   # inside the built image
 ```
 

@@ -6,7 +6,7 @@ import io
 import re
 import uuid
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Form, Header, HTTPException, Request
 from fastapi.responses import PlainTextResponse
 
 app = FastAPI(title="Salesforce Bulk API v2 Mock")
@@ -67,13 +67,17 @@ def health():
 
 
 @app.post("/services/oauth2/token")
-def token(grant_type: str | None = None, client_id: str | None = None, refresh_token: str | None = None):
-    # FastAPI reads x-www-form-urlencoded fields as query/body params of the same name.
+def token(
+    request: Request,
+    grant_type: str | None = Form(None),
+    client_id: str | None = Form(None),
+    refresh_token: str | None = Form(None),
+):
     if grant_type != "refresh_token" or not client_id or not refresh_token:
         raise HTTPException(400, "invalid_grant")
     access_token = uuid.uuid4().hex
     TOKENS.add(access_token)
-    return {"access_token": access_token, "token_type": "Bearer", "instance_url": "http://mock-salesforce:9000"}
+    return {"access_token": access_token, "token_type": "Bearer", "instance_url": str(request.base_url).rstrip("/")}
 
 
 def _check_auth(authorization: str | None):
