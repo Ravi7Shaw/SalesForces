@@ -1101,7 +1101,7 @@ async function inspect(objectName){
       </div>
 
       <div style="margin-top:16px;font-size:11px;color:var(--muted)">
-        ${esc(data.engine)} · ORDER BY (${esc((data.sorting_key||[]).join(", ") || data.sorting_key)})
+        ${esc(data.engine)} · ORDER BY (${esc(data.sorting_key)})
         · PARTITION BY ${esc(data.partition_key)}
       </div>
 
@@ -1147,8 +1147,10 @@ async function renderObjects(jobs){
   const latest =
     jobs.find(
       x => x.status === "running" ||
-           x.status === "pending"
-    );
+           x.status === "pending" ||
+           x.status === "pausing" ||
+           x.status === "cancelling"
+    ) || jobs[0];
 
   const completed =
     new Set(
@@ -1159,11 +1161,11 @@ async function renderObjects(jobs){
     latest?.current_object;
 
   document.getElementById("objects").innerHTML =
-    SALESFORCE_OBJECTS.map(obj => {
+    (latest?.objects || SALESFORCE_OBJECTS).map(obj => {
 
       const done = completed.has(obj);
 
-      const active = current === obj;
+      const active = current === obj && ["running", "pausing", "cancelling"].includes(latest?.status);
 
       const width =
         done ? 100 :
@@ -1331,7 +1333,7 @@ function renderJobs(jobs){
 
       }
 
-      if(status === "paused"){
+      if(["paused", "interrupted", "failed"].includes(status)){
 
         actions += `
           <button
