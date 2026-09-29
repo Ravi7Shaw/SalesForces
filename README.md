@@ -1,67 +1,80 @@
 # BE-1 — Salesforce Bulk API v2 Ingestion Service & UI
 
-A complete local implementation of **Task 1 / BE-1** from the Backend Engineering Platform specification. The task requires a Salesforce Bulk API v2 client, 10+ object extraction, MinIO landing, ClickHouse tables, a monitoring UI, and retry handling. The official task document also calls for demonstrating a bulk ingestion run, landed MinIO files, and a ClickHouse query.
+A local implementation of **Task 1 / BE-1**: a Salesforce Bulk API v2 client, 10+ object
+extraction, MinIO landing, ClickHouse tables, a monitoring UI, retry handling, and API
+authentication.
 
 ## Architecture
 
 ```text
-Salesforce Bulk API v2 / local Salesforce mock
+Salesforce Bulk API v2 (real org or local mock, same OAuth2 refresh-token flow)
                  |
                  v
-        FastAPI ingestion API
+        FastAPI ingestion API  (X-API-Key / HMAC auth on every /api/v1 route)
                  |
-        background ingestion worker
+        background ingestion worker (per-job thread, concurrency-limited,
+        crash-recovered at startup)
           /       |          \
          v        v           v
    PostgreSQL   MinIO      ClickHouse
    job state    raw CSV    analytics tables
-                 |              |
+   + per-object  |              ^
+   checkpoints   +--------------+  (loaded back from MinIO, not from memory)
+                 |
                  +-------> dashboard
 ```
 
-## BE-1 requirements implemented
+`app/services/schema.py` is the single source of truth: it defines, per object, the real
+Salesforce API name, the SOQL query, the CSV→typed-row conversion and the ClickHouse DDL, so
+those three can't drift out of sync with each other.
 
-- Salesforce Bulk API v2-style create/status/results flow
-- OAuth2 refresh-token authentication path for real Salesforce
-- Local synthetic Salesforce mock for credential-free testing
-- 10 Salesforce objects:
-  - Accounts
-  - Contacts
-  - Opportunities
-  - Leads
-  - Tasks
-  - Cases
-  - Products
-  - PricebookEntries
-  - Contracts
-  - Assets
-- Raw files in MinIO under:
-  `salesforce/{object}/{organization_id}/{YYYY-MM-DD}/{job_id}.csv`
-- Dynamically created typed ClickHouse tables
-- `organisation_id` table partitioning and `(organisation_id, id)` ordering
-- Idempotent ClickHouse storage using `ReplacingMergeTree`
-- PostgreSQL job metadata/checkpoints
-- Job status, row counts, current object, completed objects and errors
-- Pause / resume / cancel controls
-- Exponential backoff with `Retry-After` support for 408/429/5xx responses
-- Monitoring web console
-- MinIO landed-file browser in the dashboard
-- ClickHouse table inspection API
-- Automated unit/API tests
-- Docker Compose deployment
+## What's implemented
 
-These map directly to the BE-1 task breakdown and acceptance criteria in the supplied specification.
+- Bulk API v2 query flow: `Create Job` → poll `Get Job Status` → `Retrieve Results`, with
+  `Sforce-Locator` pagination (both the real client and the mock page results, so multi-page
+  responses are exercised, not assumed away)
+- OAuth2 refresh-token authentication — the same code path for the mock and a real org; only
+  `SALESFORCE_BASE_URL` differs
+- 10 Salesforce objects, using their real Salesforce API names in every query:
+
+  | Dashboard name    | Salesforce API name |
+  |---|---|
+  | Accounts | `Account` |
+  | Contacts | `Contact` |
+  | Opportunities | `Opportunity` |
+  | Leads | `Lead` |
+  | Tasks | `Task` |
+  | Cases | `Case` |
+  | Products | `Product2` |
+  | PricebookEntries | `PricebookEntry` |
+  | Contracts | `Contract` |
+  | Assets | `Asset` |
+
+- Raw files land in MinIO at `salesforce/{object}/{organization_id}/{YYYY-MM-DD}/{object}_{job_id}.csv`
+- ClickHouse tables (`ReplacingMergeTree`, partitioned and ordered by `(organisation_id, id)`)
+  are created from the same schema definitions and loaded by reading the file back out of
+  MinIO — not from the in-memory response — per the acceptance criteria
+- Postgres job state **and** a per-object `job_objects` checkpoint table (Salesforce job id,
+  row count, landed key, error, timing)
+- **API authentication** (`X-API-Key` or HMAC request signing with replay protection) required
+  on every `/api/v1/*` route; the app refuses to start with auth on and no credentials set
+- **Crash recovery**: a startup sweep marks any job still `running` as `interrupted`;
+  `/resume` accepts `paused`, `interrupted` and `failed`, and skips objects already recorded in
+  the checkpoint. Previously a crash left a job stuck `running` forever with no way to resume it
+- Pause / resume / cancel, checked between objects (not mid-fetch — see Known limitations)
+- Worker concurrency capped by `MAX_CONCURRENT_JOBS`
+- Exponential backoff + jitter, retrying 408/429/5xx and transport errors, honouring
+  `Retry-After` where Salesforce sends it
+- Monitoring dashboard: job list with status badges, per-object progress, row counts, MinIO
+  file browser, ClickHouse table inspector (engine, partition/sort keys, schema, sample rows)
+- Test suite covering auth (API key, HMAC, replay, staleness), schema/CSV mapping, and the
+  pause/resume/crash-recovery state machine against a faked Salesforce/MinIO/ClickHouse layer
 
 ## Start
 
 ```bash
 cp .env.example .env
 docker compose up --build -d
-```
-
-Check:
-
-```bash
 docker compose ps
 curl http://localhost:8000/health
 ```
@@ -69,21 +82,19 @@ curl http://localhost:8000/health
 Open:
 
 - API docs: http://localhost:8000/docs
-- Dashboard: http://localhost:8000/dashboard
-- MinIO console: http://localhost:9001
+- Dashboard: http://localhost:8000/dashboard — paste the `API_KEY` from `.env` into the
+  "API key" field in the top bar; it's stored only in your browser
+- MinIO console: http://localhost:9001 (`minioadmin` / `minioadmin`)
 - ClickHouse HTTP: http://localhost:8123
 - Mock Salesforce: http://localhost:9003
 
-MinIO credentials:
-
-```text
-minioadmin / minioadmin
-```
-
 ## Run the 10-object demo
+
+The default `.env.example` ships with `API_KEY=dev-local-key` for local use.
 
 ```bash
 curl -X POST http://localhost:8000/api/v1/jobs/sync \
+  -H 'X-API-Key: dev-local-key' \
   -H 'Content-Type: application/json' \
   -d '{"organization_id":"demo-org","records_per_object":100}'
 ```
@@ -91,20 +102,23 @@ curl -X POST http://localhost:8000/api/v1/jobs/sync \
 Copy the returned `job_id`, then:
 
 ```bash
-curl http://localhost:8000/api/v1/jobs/<job_id>
+curl -H 'X-API-Key: dev-local-key' http://localhost:8000/api/v1/jobs/<job_id>
 ```
 
 A successful run ends with:
 
 ```json
-{
-  "status": "completed",
-  "processed_objects": 10,
-  "total_rows": 1000
-}
+{"status": "completed", "processed_objects": 10, "total_rows": 1000}
 ```
 
-Open the dashboard to show status, row counts, pause/resume/cancel controls and landed MinIO files.
+Per-object detail (Salesforce job id, landed MinIO key, row count):
+
+```bash
+curl -H 'X-API-Key: dev-local-key' http://localhost:8000/api/v1/jobs/<job_id>/objects
+```
+
+Open the dashboard to see the same thing live: status, per-object progress, pause/resume/cancel,
+and the landed MinIO files.
 
 ## Verify ClickHouse
 
@@ -113,56 +127,64 @@ docker compose exec clickhouse clickhouse-client --query \
   "SELECT count() FROM analytics.salesforce_accounts FINAL"
 ```
 
-Inspect the generated table:
+Or through the API (also returns engine, partition/sort keys and a few sample rows):
 
 ```bash
-docker compose exec clickhouse clickhouse-client --query \
-  "DESCRIBE TABLE analytics.salesforce_accounts"
-```
-
-Or through the API:
-
-```bash
-curl http://localhost:8000/api/v1/clickhouse/Accounts
+curl -H 'X-API-Key: dev-local-key' http://localhost:8000/api/v1/clickhouse/Accounts
 ```
 
 ## Verify MinIO
 
 ```bash
-curl 'http://localhost:8000/api/v1/storage?prefix=salesforce/'
+curl -H 'X-API-Key: dev-local-key' 'http://localhost:8000/api/v1/storage?prefix=salesforce/'
 ```
-
-The dashboard also displays the landed objects.
 
 ## Tests
 
-Run locally with the project environment:
-
 ```bash
-pytest -q
+pytest -q                            # locally, no services required (sqlite + fakes)
+docker compose run --rm api pytest -q   # inside the built image
 ```
 
-Run inside Docker after building:
+## Authentication
 
-```bash
-docker compose run --rm api pytest -q
-```
+Every `/api/v1/*` route requires one of:
+
+- `X-API-Key: <API_KEY>` — what the dashboard uses.
+- HMAC request signing — for service-to-service callers. Sign
+  `{timestamp}\n{METHOD}\n{path}[?{query}]\n{sha256_hex(body)}` with `HMAC_SECRET` (SHA-256,
+  hex) and send `X-Timestamp` + `X-Signature`. Requests older/newer than
+  `AUTH_MAX_SKEW_SECONDS` (default 300s) are rejected, and a signature can't be replayed within
+  that window. See `app/auth.py::signed_headers` for a reference implementation.
+
+Set `AUTH_ENABLED=false` only for local hacking with no exposed port; the app refuses to boot
+with auth on and neither `API_KEY` nor `HMAC_SECRET` set.
 
 ## Real Salesforce
 
-Set these values in `.env` and use `SALESFORCE_MODE=real`:
+Set these in `.env`:
 
 ```text
 SALESFORCE_BASE_URL=https://your-domain.my.salesforce.com
+SALESFORCE_LOGIN_URL=https://login.salesforce.com   # or your My Domain login host
 SALESFORCE_CLIENT_ID=...
 SALESFORCE_CLIENT_SECRET=...
 SALESFORCE_REFRESH_TOKEN=...
 ```
 
-The service then uses the OAuth2 refresh-token flow and Salesforce Bulk API v2 endpoints.
+`SALESFORCE_MODE` is informational only — mock and real mode run the exact same OAuth2 +
+Bulk API v2 code path; only the base URL changes. This has **not** been tested against a real
+org in this environment (no live credentials available); the object names, SOQL and paging
+logic follow the documented Bulk API v2 contract, but please verify against a sandbox before
+relying on it.
 
-## Notes for the review/demo
+## Known limitations
 
-The supplied BE-1 review question asks for a demonstration of a bulk run across 10 Salesforce objects, MinIO landed files, and a ClickHouse query.
-
-For production deployment, the next hardening steps would be external secret management, distributed workers/locks, authentication/authorization, metrics/tracing, migrations, and deployment-specific security policies. The local implementation intentionally uses Docker Compose and a synthetic API so the entire acceptance flow can be demonstrated without paid Salesforce production credentials, which the task explicitly permits.
+- Pause/cancel are checked between objects, not mid-fetch — a large in-flight object still runs
+  to completion before a pause takes effect.
+- The worker is in-process threads, not a distributed queue; it does not survive more than one
+  API replica. `MAX_CONCURRENT_JOBS` limits concurrency within a single process only.
+- `AUTO_RESUME_ON_STARTUP=true` will auto-resume every job recovered as `interrupted`; left
+  `false` by default so a crash doesn't silently retry something that failed for a real reason.
+- ClickHouse column sets are the fields listed in `app/services/schema.py`, not `FIELDS(ALL)` —
+  add fields there (and to the matching mock/test fixtures) to widen an object's schema.

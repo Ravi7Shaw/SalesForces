@@ -1,243 +1,123 @@
-import csv
-import io
+"""Salesforce Bulk API v2 (query) client.
+
+Auth is always the OAuth2 refresh-token flow. "Mock" and "real" mode differ only
+by SALESFORCE_BASE_URL, so the exact same code path is exercised in tests.
+"""
 import time
-from datetime import datetime, timezone
+from collections.abc import Callable
 
 import httpx
 
 from app.config import settings
 from app.services.retry import retry_call
+from app.services.schema import OBJECTS, csv_rows, soql  # noqa: F401  (re-exported)
 
-OBJECTS = [
-    "Accounts",
-    "Contacts",
-    "Opportunities",
-    "Leads",
-    "Tasks",
-    "Cases",
-    "Products",
-    "PricebookEntries",
-    "Contracts",
-    "Assets",
-]
+TERMINAL_STATES = {"JobComplete", "Failed", "Aborted"}
 
 
 class SalesforceBulkClient:
-    """Small Salesforce Bulk API v2 query client with mock/real authentication."""
+    def __init__(
+        self,
+        client: httpx.Client | None = None,
+        base_url: str | None = None,
+        sleep: Callable[[float], None] = time.sleep,
+    ):
+        self.base = (base_url or settings.salesforce_base_url).rstrip("/")
+        self.login_url = (settings.salesforce_login_url or self.base).rstrip("/")
+        self.client = client or httpx.Client(timeout=httpx.Timeout(60.0, connect=10.0))
+        self._sleep = sleep
+        self._token: str | None = None
+        self._api = f"/services/data/{settings.salesforce_api_version}"
 
-    def __init__(self):
-        self.base = settings.salesforce_base_url.rstrip("/")
-        self.client = httpx.Client(timeout=httpx.Timeout(60.0, connect=10.0))
-
-    def token(self) -> str:
-        if settings.salesforce_mode == "mock":
-            return "mock-token"
-
-        response = self.client.post(
-            f"{self.base}/services/oauth2/token",
-            data={
-                "grant_type": "refresh_token",
-                "client_id": settings.salesforce_client_id,
-                "client_secret": settings.salesforce_client_secret,
-                "refresh_token": settings.salesforce_refresh_token,
-            },
-        )
-        response.raise_for_status()
-        return response.json()["access_token"]
-
-    def _headers(self, token: str) -> dict[str, str]:
-        return {"Authorization": f"Bearer {token}"}
-
-    def create_query_job(self, token: str, obj: str, records: int) -> str:
-        query = f"SELECT FIELDS(ALL) FROM {obj} LIMIT {int(records)}"
-
+    # ---- auth -----------------------------------------------------------
+    def authenticate(self) -> str:
         def request():
             response = self.client.post(
-                f"{self.base}/services/data/v60.0/jobs/query",
-                headers=self._headers(token),
-                json={"operation": "query", "query": query, "contentType": "CSV"},
+                f"{self.login_url}/services/oauth2/token",
+                data={
+                    "grant_type": "refresh_token",
+                    "client_id": settings.salesforce_client_id,
+                    "client_secret": settings.salesforce_client_secret,
+                    "refresh_token": settings.salesforce_refresh_token,
+                },
             )
             response.raise_for_status()
-            return response.json()["id"]
+            return response.json()
 
-        return retry_call(request)
+        data = retry_call(request, sleep=self._sleep)
+        self._token = data["access_token"]
+        if data.get("instance_url"):  # real orgs tell us which instance to call
+            self.base = data["instance_url"].rstrip("/")
+        return self._token
 
-    def wait_for_job(self, token: str, job_id: str) -> dict:
-        for _ in range(300):
+    def _request(self, method: str, path: str, **kwargs) -> httpx.Response:
+        """Authenticated request with backoff; re-authenticates once on 401 (expired token)."""
+        for attempt in (0, 1):
+            if not self._token:
+                self.authenticate()
 
-            def request():
-                response = self.client.get(
-                    f"{self.base}/services/data/v60.0/jobs/query/{job_id}",
-                    headers=self._headers(token),
+            def call():
+                response = self.client.request(
+                    method, f"{self.base}{path}", headers={"Authorization": f"Bearer {self._token}"}, **kwargs
                 )
                 response.raise_for_status()
-                return response.json()
+                return response
 
-            data = retry_call(request)
-            if data["state"] in {"JobComplete", "Failed", "Aborted"}:
-                return data
-            time.sleep(0.2)
-        raise TimeoutError(
-            f"Salesforce Bulk job {job_id} did not finish within 60 seconds"
+            try:
+                return retry_call(call, sleep=self._sleep)
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code == 401 and attempt == 0:
+                    self._token = None
+                    continue
+                raise
+        raise RuntimeError("unreachable")
+
+    # ---- Bulk API v2 ----------------------------------------------------
+    def create_query_job(self, obj: str, records: int) -> str:
+        response = self._request(
+            "POST",
+            f"{self._api}/jobs/query",
+            json={"operation": "query", "query": soql(obj, records), "contentType": "CSV"},
         )
+        return response.json()["id"]
 
-    def results(self, token: str, job_id: str) -> str:
-        def request():
-            response = self.client.get(
-                f"{self.base}/services/data/v60.0/jobs/query/{job_id}/results",
-                headers=self._headers(token),
-            )
-            response.raise_for_status()
+    def wait_for_job(self, job_id: str) -> dict:
+        waited, delay = 0.0, 0.2
+        while waited <= settings.job_timeout_seconds:
+            data = self._request("GET", f"{self._api}/jobs/query/{job_id}").json()
+            if data["state"] in TERMINAL_STATES:
+                return data
+            self._sleep(delay)
+            waited += delay
+            delay = min(delay * 1.5, 5.0)
+        raise TimeoutError(f"Salesforce Bulk job {job_id} did not finish within {settings.job_timeout_seconds}s")
 
+    def results(self, job_id: str) -> str:
+        """Fetch every results page (Sforce-Locator paging) and return one CSV document."""
+        parts: list[str] = []
+        header: str | None = None
+        locator: str | None = None
+        while True:
+            params = {"maxRecords": settings.bulk_page_size}
+            if locator:
+                params["locator"] = locator
+            response = self._request("GET", f"{self._api}/jobs/query/{job_id}/results", params=params)
             text = response.text
-
-            # Mock Salesforce returns the CSV as a JSON-encoded string.
-            # Decode it so downstream CSV parsing receives real CSV text.
-            if text.startswith('"') and text.endswith('"'):
-                try:
-                    import json
-
-                    text = json.loads(text)
-                except json.JSONDecodeError:
-                    pass
-
-            return text
-
-        return retry_call(request)
+            if text and not text.endswith("\n"):
+                text += "\n"
+            if header is None:
+                header = text.split("\n", 1)[0]
+            elif text.split("\n", 1)[0] == header:
+                text = text.split("\n", 1)[1] if "\n" in text else ""  # repeated header on later pages
+            parts.append(text)
+            locator = response.headers.get("Sforce-Locator")
+            if not locator or locator.lower() == "null":
+                break
+        return "".join(parts)
 
     def run(self, obj: str, records: int) -> tuple[str, str]:
-        token = self.token()
-        job_id = self.create_query_job(token, obj, records)
-        state = self.wait_for_job(token, job_id)
+        job_id = self.create_query_job(obj, records)
+        state = self.wait_for_job(job_id)
         if state["state"] != "JobComplete":
-            raise RuntimeError(
-                state.get("errorMessage", f"Salesforce job ended in {state['state']}")
-            )
-        return job_id, self.results(token, job_id)
-
-
-def csv_rows(obj: str, text: str, organisation_id: str):
-    reader = csv.DictReader(io.StringIO(text))
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
-    out = []
-    for row in reader:
-        if obj == "Accounts":
-            out.append(
-                [
-                    row.get("Id", ""),
-                    row.get("Name", ""),
-                    row.get("Industry"),
-                    row.get("Website"),
-                    organisation_id,
-                    now,
-                ]
-            )
-        elif obj == "Contacts":
-            out.append(
-                [
-                    row.get("Id", ""),
-                    row.get("FirstName", ""),
-                    row.get("LastName", ""),
-                    row.get("Email"),
-                    row.get("AccountId"),
-                    organisation_id,
-                    now,
-                ]
-            )
-        elif obj == "Opportunities":
-            out.append(
-                [
-                    row.get("Id", ""),
-                    row.get("Name", ""),
-                    float(row.get("Amount") or 0),
-                    row.get("StageName", ""),
-                    row.get("AccountId"),
-                    organisation_id,
-                    now,
-                ]
-            )
-        elif obj == "Leads":
-            out.append(
-                [
-                    row.get("Id", ""),
-                    row.get("FirstName", ""),
-                    row.get("LastName", ""),
-                    row.get("Company"),
-                    row.get("Email"),
-                    row.get("Status", ""),
-                    organisation_id,
-                    now,
-                ]
-            )
-        elif obj == "Tasks":
-            out.append(
-                [
-                    row.get("Id", ""),
-                    row.get("Subject", ""),
-                    row.get("Status", ""),
-                    row.get("ActivityDate", ""),
-                    row.get("OwnerId"),
-                    organisation_id,
-                    now,
-                ]
-            )
-        elif obj == "Cases":
-            out.append(
-                [
-                    row.get("Id", ""),
-                    row.get("Subject", ""),
-                    row.get("Status", ""),
-                    row.get("Priority", ""),
-                    row.get("AccountId"),
-                    organisation_id,
-                    now,
-                ]
-            )
-        elif obj == "Products":
-            out.append(
-                [
-                    row.get("Id", ""),
-                    row.get("Name", ""),
-                    row.get("ProductCode", ""),
-                    row.get("Family"),
-                    str(row.get("IsActive", "true")).lower() == "true",
-                    organisation_id,
-                    now,
-                ]
-            )
-        elif obj == "PricebookEntries":
-            out.append(
-                [
-                    row.get("Id", ""),
-                    row.get("Product2Id", ""),
-                    float(row.get("UnitPrice") or 0),
-                    str(row.get("IsActive", "true")).lower() == "true",
-                    organisation_id,
-                    now,
-                ]
-            )
-        elif obj == "Contracts":
-            out.append(
-                [
-                    row.get("Id", ""),
-                    row.get("AccountId"),
-                    row.get("Status", ""),
-                    row.get("StartDate", ""),
-                    row.get("EndDate", ""),
-                    organisation_id,
-                    now,
-                ]
-            )
-        elif obj == "Assets":
-            out.append(
-                [
-                    row.get("Id", ""),
-                    row.get("Name", ""),
-                    row.get("AccountId"),
-                    row.get("Product2Id"),
-                    row.get("Status", ""),
-                    organisation_id,
-                    now,
-                ]
-            )
-    return out
+            raise RuntimeError(state.get("errorMessage") or f"Salesforce job {job_id} ended in {state['state']}")
+        return job_id, self.results(job_id)

@@ -626,7 +626,14 @@ pre{
     </div>
   </div>
 
-  <div class="system-status">
+  <div class="system-status" style="gap:14px">
+    <input
+      class="input"
+      id="apiKey"
+      type="password"
+      placeholder="API key"
+      style="width:150px;padding:6px 10px;font-size:11px"
+      title="Sent as X-API-Key on every request. Stored only in this browser.">
     <span class="status-dot"></span>
     Pipeline Operational
     <span id="lastRefresh">· live</span>
@@ -876,6 +883,31 @@ pre{
 
 const api = "/api/v1";
 
+// The dashboard authenticates with X-API-Key (see app/auth.py). The key never
+// leaves this browser: it's kept in localStorage purely so you don't retype it
+// on every reload, and attached to every /api/v1 request below.
+const keyInput = document.getElementById("apiKey");
+keyInput.value = localStorage.getItem("be1_api_key") || "";
+keyInput.addEventListener("change", () => {
+  localStorage.setItem("be1_api_key", keyInput.value);
+});
+
+function authHeaders(extra){
+  const key = keyInput.value.trim();
+  return { ...(key ? {"X-API-Key": key} : {}), ...(extra || {}) };
+}
+
+async function apiFetch(path, options){
+  const response = await fetch(`${api}${path}`, {
+    ...options,
+    headers: authHeaders(options?.headers)
+  });
+  if(response.status === 401){
+    document.getElementById("lastRefresh").textContent = "· needs API key";
+  }
+  return response;
+}
+
 const SALESFORCE_OBJECTS = [
   "Accounts",
   "Contacts",
@@ -950,8 +982,8 @@ async function sync(){
 
   try{
 
-    const response = await fetch(
-      `${api}/jobs/sync`,
+    const response = await apiFetch(
+      `/jobs/sync`,
       {
         method:"POST",
         headers:{
@@ -991,8 +1023,8 @@ async function action(id, actionName){
 
   try{
 
-    const response = await fetch(
-      `${api}/jobs/${id}/${actionName}`,
+    const response = await apiFetch(
+      `/jobs/${id}/${actionName}`,
       {
         method:"POST"
       }
@@ -1038,8 +1070,8 @@ async function inspect(objectName){
   try{
 
     const response =
-      await fetch(
-        `${api}/clickhouse/${encodeURIComponent(objectName)}`
+      await apiFetch(
+        `/clickhouse/${encodeURIComponent(objectName)}`
       );
 
     const data = await response.json();
@@ -1068,6 +1100,11 @@ async function inspect(objectName){
 
       </div>
 
+      <div style="margin-top:16px;font-size:11px;color:var(--muted)">
+        ${esc(data.engine)} · ORDER BY (${esc((data.sorting_key||[]).join(", ") || data.sorting_key)})
+        · PARTITION BY ${esc(data.partition_key)}
+      </div>
+
       <h4 style="margin-top:25px">
         Schema
       </h4>
@@ -1075,6 +1112,11 @@ async function inspect(objectName){
       <pre>${esc(
         JSON.stringify(data.columns,null,2)
       )}</pre>
+
+      ${data.sample && data.sample.length ? `
+        <h4 style="margin-top:20px">Sample rows</h4>
+        <pre>${esc(JSON.stringify(data.sample,null,2))}</pre>
+      ` : ""}
 
     `;
 
@@ -1166,9 +1208,14 @@ async function refresh(){
 
     const [jobsResponse,filesResponse] =
       await Promise.all([
-        fetch(`${api}/jobs`),
-        fetch(`${api}/storage?prefix=salesforce/`)
+        apiFetch(`/jobs`),
+        apiFetch(`/storage?prefix=salesforce/`)
       ]);
+
+    if(jobsResponse.status === 401 || filesResponse.status === 401){
+      document.getElementById("lastRefresh").textContent = "· enter API key above";
+      return;
+    }
 
     const jobs =
       await jobsResponse.json();

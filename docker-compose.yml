@@ -69,6 +69,10 @@ services:
       SALESFORCE_CLIENT_ID: mock-client
       SALESFORCE_CLIENT_SECRET: mock-secret
       SALESFORCE_REFRESH_TOKEN: mock-refresh
+      AUTH_ENABLED: "true"
+      API_KEY: dev-local-key
+      HMAC_SECRET: dev-local-hmac-secret
+      MAX_CONCURRENT_JOBS: "2"
     ports: ["8000:8000"]
     depends_on:
       postgres:
